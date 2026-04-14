@@ -64,8 +64,8 @@ def get_connection():
 _connection = None
 
 
-# Regex to detect and capture a top-level LIMIT clause at the end of a query
-_LIMIT_RE = re.compile(r"\bLIMIT\s+(\d+)\s*$", re.IGNORECASE)
+# Regex to detect and capture a top-level LIMIT clause (with optional OFFSET)
+_LIMIT_RE = re.compile(r"\bLIMIT\s+(\d+)(\s+OFFSET\s+\d+)?\s*$", re.IGNORECASE)
 
 # Concurrency limit: at most 5 queries running at once
 _query_semaphore = threading.Semaphore(5)
@@ -131,7 +131,8 @@ def run_query(sql: str, params: list | None = None, limit: int | None = None) ->
     if match:
         user_limit = int(match.group(1))
         capped = min(user_limit, MAX_ROWS)
-        sql = clean[:match.start()] + f"LIMIT {capped}"
+        offset_part = match.group(2) or ""
+        sql = clean[:match.start()] + f"LIMIT {capped}{offset_part}"
     else:
         sql = clean + f" LIMIT {effective_limit}"
 
