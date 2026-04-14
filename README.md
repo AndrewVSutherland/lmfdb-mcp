@@ -9,8 +9,8 @@ Once deployed and connected, users can make natural-language requests like:
 > "Create a scatter plot of number of rational points vs analytic rank for
 > genus 2 curves in the LMFDB with Sato-Tate group USp(4)."
 
-…and Claude will query the database, analyze the results, and produce plots —
-all within the chat interface, with no code to run.
+…and Claude will query the database, analyze results, and produce plots —
+all within the chat interface, no code to run.
 
 The code in this repository was written entirely by Claude Opus 4.6.
 
