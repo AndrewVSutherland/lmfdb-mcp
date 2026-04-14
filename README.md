@@ -6,7 +6,7 @@ A remote [MCP](https://modelcontextprotocol.io/) server that gives Claude
 
 Once deployed and connected, users can make natural-language requests like:
 
-> "Download all genus 2 curves with Sato-Tate group USp(4), create a scatter
+> "For all genus 2 curves in the LMFDB with Sato-Tate group USp(4), create a scatter
 > plot of number of rational points vs analytic rank, and compute the
 > correlation."
 
