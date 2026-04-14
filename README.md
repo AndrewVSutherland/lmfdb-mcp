@@ -16,7 +16,7 @@ all within the chat interface, with no code to run.
 ## Architecture
 
 ```
-┌──────────────┐     HTTPS      ┌──────────────────┐    PostgreSQL   ┌──────────────────┐
+┌──────────────┐     HTTPS      ┌──────────────────┐    PostgreSQL  ┌──────────────────┐
 │  Claude.ai   │ ──────────────►│  lmfdb-mcp       │ ──────────────►│ devmirror        │
 │  (any user)  │   MCP protocol │  (Cloud Run)     │   read-only    │ .lmfdb.xyz:5432  │
 └──────────────┘                └──────────────────┘                └──────────────────┘
@@ -29,17 +29,13 @@ all within the chat interface, with no code to run.
 | `list_tables`   | List all tables, optionally filtered by prefix        |
 | `describe_table`| Show column names and types for a table               |
 | `sample_rows`   | Return a small sample from a table                    |
-| `query`         | Run an arbitrary SELECT query (max 10,000 rows)       |
+| `run_sql`       | Run an arbitrary SELECT query (max 100,000 rows)      |
 | `count_rows`    | Count rows with optional WHERE clause                 |
 | `table_stats`   | Compute min/max/avg/stddev for a numeric column       |
 
 ## Deployment to Google Cloud Run
 
-### Prerequisites
-
-- [Google Cloud CLI](https://cloud.google.com/sdk/docs/install) (`gcloud`)
-- A GCP project with billing enabled
-- Docker (or use Cloud Build)
+The instructions below assume you are an administrator of the lmfdb-mirror project on Google Cloud.
 
 ### Steps
 
@@ -48,20 +44,19 @@ all within the chat interface, with no code to run.
 gcloud config set project YOUR_PROJECT_ID
 
 # 2. Build and push the container
-gcloud builds submit --tag gcr.io/YOUR_PROJECT_ID/lmfdb-mcp
+gcloud builds submit --tag us-central1-docker.pkg.dev/lmfdbmirror/lmfdb-mcp/lmfdb-mcp
 
 # 3. Deploy to Cloud Run
 gcloud run deploy lmfdb-mcp \
-  --image gcr.io/YOUR_PROJECT_ID/lmfdb-mcp \
+  --image us-central1-docker.pkg.dev/lmfdbmirror/lmfdb-mcp/lmfdb-mcp \
   --platform managed \
   --region us-central1 \
   --allow-unauthenticated \
   --port 8080 \
   --memory 512Mi \
-  --timeout 300
+  --timeout 300 \
+  --min-instances=1
 ```
-
-This gives you a URL like `https://lmfdb-mcp-XXXXX-uc.a.run.app`.
 
 ### Environment Variables (optional)
 
@@ -72,7 +67,7 @@ This gives you a URL like `https://lmfdb-mcp-XXXXX-uc.a.run.app`.
 | `LMFDB_DBNAME`       | `lmfdb`               | Database name                  |
 | `LMFDB_USER`         | `lmfdb`               | Database user                  |
 | `LMFDB_PASSWORD`     | `lmfdb`               | Database password              |
-| `LMFDB_MAX_ROWS`     | `10000`               | Hard limit on returned rows    |
+| `LMFDB_MAX_ROWS`     | `100000`              | Hard limit on returned rows    |
 | `LMFDB_DEFAULT_LIMIT`| `100`                 | Default LIMIT if not specified |
 | `PORT`               | `8000`                | HTTP port (Cloud Run sets this)|
 
@@ -84,7 +79,7 @@ This gives you a URL like `https://lmfdb-mcp-XXXXX-uc.a.run.app`.
 2. Click **Add custom connector**
 3. Enter:
    - **Name:** `LMFDB`
-   - **URL:** `https://YOUR-CLOUD-RUN-URL/mcp`
+   - **URL:** `https://mcp.lmfdb.org/mcp`
 4. Click **Add**
 5. In any conversation, click **+** → **Connectors** → enable **LMFDB**
 
@@ -110,7 +105,7 @@ npx @modelcontextprotocol/inspector http://localhost:8000/mcp
 
 - The server only allows `SELECT`, `WITH`, and `EXPLAIN` queries.
 - A 120-second statement timeout prevents runaway queries.
-- Row results are capped at 10,000.
+- Row results are capped at 100,000.
 - The underlying LMFDB mirror is read-only; writes will fail at the
   database level regardless of what SQL is sent.
 - For production, consider adding authentication (OAuth or API key)
