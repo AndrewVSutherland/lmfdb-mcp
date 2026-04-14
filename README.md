@@ -6,9 +6,8 @@ A remote [MCP](https://modelcontextprotocol.io/) server that gives Claude
 
 Once deployed and connected, users can make natural-language requests like:
 
-> "For all genus 2 curves in the LMFDB with Sato-Tate group USp(4), create a scatter
-> plot of number of rational points vs analytic rank, and compute the
-> correlation."
+> "Create a scatter plot of number of rational points vs analytic rank for
+> genus 2 curves in the LMFDB with Sato-Tate group USp(4)."
 
 …and Claude will query the database, analyze the results, and produce plots —
 all within the chat interface, with no code to run.
@@ -108,9 +107,7 @@ npx @modelcontextprotocol/inspector http://localhost:8000/mcp
 - Row results are capped at 100,000.
 - The underlying LMFDB mirror is read-only; writes will fail at the
   database level regardless of what SQL is sent.
-- For production, consider adding authentication (OAuth or API key)
-  if you want to restrict access beyond what the LMFDB mirror itself
-  allows.  The default config is auth-less, which is appropriate since
+- The default config is auth-less, which is appropriate since
   the LMFDB mirror credentials are public.
 
 ## License
