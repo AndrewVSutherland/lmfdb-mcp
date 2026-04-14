@@ -64,8 +64,8 @@ def get_connection():
 _connection = None
 
 
-# Regex to detect a top-level LIMIT clause at the end of a query
-_LIMIT_RE = re.compile(r"\bLIMIT\s+\d+\s*$", re.IGNORECASE)
+# Regex to detect and capture a top-level LIMIT clause at the end of a query
+_LIMIT_RE = re.compile(r"\bLIMIT\s+(\d+)\s*$", re.IGNORECASE)
 
 # Concurrency limit: at most 5 queries running at once
 _query_semaphore = threading.Semaphore(5)
@@ -125,12 +125,15 @@ def run_query(sql: str, params: list | None = None, limit: int | None = None) ->
 
     effective_limit = min(limit or DEFAULT_LIMIT, MAX_ROWS)
 
-    # Only append LIMIT if the query doesn't already end with one
+    # If query has a LIMIT, cap it at MAX_ROWS; otherwise append one
     clean = stripped.rstrip(";").rstrip()
-    if not _LIMIT_RE.search(clean):
-        sql = clean + f" LIMIT {effective_limit}"
+    match = _LIMIT_RE.search(clean)
+    if match:
+        user_limit = int(match.group(1))
+        capped = min(user_limit, MAX_ROWS)
+        sql = clean[:match.start()] + f"LIMIT {capped}"
     else:
-        sql = clean
+        sql = clean + f" LIMIT {effective_limit}"
 
     # Limit concurrent queries to protect devmirror
     acquired = _query_semaphore.acquire(timeout=30)
