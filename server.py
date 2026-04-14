@@ -33,7 +33,7 @@ DB_NAME = os.environ.get("LMFDB_DBNAME", "lmfdb")
 DB_USER = os.environ.get("LMFDB_USER", "lmfdb")
 DB_PASS = os.environ.get("LMFDB_PASSWORD", "lmfdb")
 
-MAX_ROWS = int(os.environ.get("LMFDB_MAX_ROWS", "10000"))
+MAX_ROWS = int(os.environ.get("LMFDB_MAX_ROWS", "100000"))
 DEFAULT_LIMIT = int(os.environ.get("LMFDB_DEFAULT_LIMIT", "100"))
 
 # ---------------------------------------------------------------------------
