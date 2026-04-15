@@ -60,9 +60,9 @@ Connectors**, and all members can then enable it per-conversation.
 3. Go to **Settings → Apps** and click **Create app**.
 4. Enter the app details:
    - **Name:** `LMFDB`
-   - **Description:** `LMFDB SQL interface`
    - **MCP server URL:** `https://mcp.lmfdb.org/mcp`
    - **Authentication:** `NoAuth`
+   - **I understand and want to continue:** tick the box (OpenAI has not reviewed this MCP server).
 5. Click **Create**.
 6. In any chat, use **+ → More** to add the **LMFDB** app.
 
