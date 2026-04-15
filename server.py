@@ -14,6 +14,7 @@ Override via environment variables if using a different mirror.
 """
 
 import json
+import logging
 import os
 import re
 import textwrap
@@ -23,6 +24,15 @@ import psycopg2
 import psycopg2.extras
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+log = logging.getLogger("lmfdb-mcp")
 
 # ---------------------------------------------------------------------------
 # Configuration (override with environment variables)
@@ -165,6 +175,12 @@ def _validate_identifier(name: str) -> bool:
     return bool(name) and name.replace("_", "").isalnum()
 
 
+def _log_tool(name: str, **kwargs):
+    """Log a tool invocation with its arguments."""
+    args = ", ".join(f"{k}={v!r}" for k, v in kwargs.items() if v)
+    log.info("tool=%s %s", name, args)
+
+
 # All tools are read-only; this tells Claude to auto-approve them.
 _READ_ONLY = {"readOnlyHint": True, "destructiveHint": False}
 
@@ -193,7 +209,7 @@ mcp = FastMCP(
           columns and types, and run_sql to execute arbitrary SELECT queries.
         - For GROUP BY, JOIN, or complex aggregations, use run_sql directly
           rather than making multiple count_rows calls.
-        - Results are limited to 10,000 rows by default.  For very large
+        - Results are limited to 100,000 rows by default.  For very large
           datasets, use WHERE clauses and aggregations.
         - Some tables have tens or hundreds of millions of rows.  Queries
           that scan full large tables (e.g. ORDER BY on unindexed columns,
@@ -215,6 +231,7 @@ def list_tables(prefix: str = "") -> str:
     Returns:
         JSON array of {table_name, row_estimate} objects.
     """
+    _log_tool("list_tables", prefix=prefix)
     sql = """
         SELECT c.relname AS table_name,
                c.reltuples::bigint AS row_estimate
@@ -245,6 +262,7 @@ def describe_table(table_name: str) -> str:
     Returns:
         JSON array of {column_name, data_type, is_nullable} objects.
     """
+    _log_tool("describe_table", table_name=table_name)
     if not _validate_identifier(table_name):
         return json.dumps({"error": "Invalid table name."})
 
@@ -280,6 +298,7 @@ def sample_rows(table_name: str, n: int = 5) -> str:
     Returns:
         JSON with columns and sample rows.
     """
+    _log_tool("sample_rows", table_name=table_name, n=n)
     if not _validate_identifier(table_name):
         return json.dumps({"error": "Invalid table name."})
     n = min(max(1, n), 50)
@@ -315,10 +334,11 @@ def run_sql(sql: str, limit: int = 100) -> str:
                - SELECT label, rank, conductor FROM ec_curvedata WHERE rank >= 3 LIMIT 20
                - SELECT st_group, COUNT(*) FROM g2c_curves GROUP BY st_group
                - SELECT AVG(rank) FROM ec_curvedata WHERE torsion_order = 5
-        limit: Maximum rows to return (default 100, max 10000).
+        limit: Maximum rows to return (default 100, max 100000).
     Returns:
         JSON with 'columns', 'row_count', and 'rows'.
     """
+    _log_tool("run_sql", sql=sql[:200], limit=limit)
     result = run_query(sql, limit=limit)
     return json.dumps(result, default=str)
 
@@ -335,6 +355,7 @@ def count_rows(table_name: str, where: str = "") -> str:
     Returns:
         JSON with the count.
     """
+    _log_tool("count_rows", table_name=table_name, where=where)
     if not _validate_identifier(table_name):
         return json.dumps({"error": "Invalid table name."})
 
@@ -362,6 +383,7 @@ def table_stats(table_name: str, column: str, where: str = "") -> str:
         JSON with count, distinct_count, and (for numeric columns)
         min, max, avg, stddev.
     """
+    _log_tool("table_stats", table_name=table_name, column=column, where=where)
     if not _validate_identifier(table_name):
         return json.dumps({"error": "Invalid table name."})
     if not _validate_identifier(column):
