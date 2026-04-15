@@ -409,7 +409,38 @@ def table_stats(table_name: str, column: str, where: str = "") -> str:
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
+    from starlette.responses import HTMLResponse
+    from starlette.routing import Route
 
     port = int(os.environ.get("PORT", "8080"))
-    app = mcp.streamable_http_app()
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    mcp_app = mcp.streamable_http_app()
+
+    LANDING_HTML = """\
+<!DOCTYPE html>
+<html>
+<head><title>LMFDB MCP Server</title></head>
+<body>
+<h1>LMFDB MCP Server</h1>
+<p>This is a <a href="https://modelcontextprotocol.io/">Model Context Protocol</a>
+server providing read-only access to the
+<a href="https://www.lmfdb.org">LMFDB</a> database.</p>
+<h2>Setup</h2>
+<ol>
+<li>In <a href="https://claude.ai">Claude</a>, go to
+<strong>Settings &rarr; Connectors &rarr; Add custom connector</strong></li>
+<li>Enter the URL: <code>https://mcp.lmfdb.org/mcp</code></li>
+<li>Enable the LMFDB connector in your conversation</li>
+</ol>
+<p>Source code: <a href="https://github.com/AndrewVSutherland/lmfdb-mcp">
+github.com/AndrewVSutherland/lmfdb-mcp</a></p>
+</body>
+</html>"""
+
+    async def landing(request):
+        return HTMLResponse(LANDING_HTML)
+
+    # Add the landing page to the MCP app's existing routes
+    mcp_app.routes.append(Route("/", landing))
+    mcp_app.middleware_stack = None  # force rebuild to pick up new route
+
+    uvicorn.run(mcp_app, host="0.0.0.0", port=port)
