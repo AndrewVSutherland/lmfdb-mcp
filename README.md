@@ -55,8 +55,8 @@ Connectors**, and all members can then enable it per-conversation.
 
 ### For Individual Users (Pro / Plus)
 
-1. Open **ChatGPT (web)**.
-2. Enable **Developer mode** in **Settings → Apps → Advanced settings**.
+1. Go to [chatgpt.com](https://chatgpt.com) **→ Settings → Apps → Advanced settings**
+2. Enable **Developer mode**.
 3. Go to **Settings → Apps** and click **Create app**.
 4. Enter the app details:
    - **Name:** `LMFDB`
