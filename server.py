@@ -338,7 +338,7 @@ def run_sql(sql: str, limit: int = 100) -> str:
     Returns:
         JSON with 'columns', 'row_count', and 'rows'.
     """
-    _log_tool("run_sql", sql=sql[:200], limit=limit)
+    _log_tool("run_sql", sql=sql[:1000], limit=limit)
     result = run_query(sql, limit=limit)
     return json.dumps(result, default=str)
 
