@@ -430,17 +430,33 @@ def table_stats(table_name: str, column: str, where: str = "") -> str:
 # Entrypoint
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
+    import urllib.request
     import uvicorn
-    from starlette.responses import HTMLResponse
+    from starlette.responses import HTMLResponse, Response
     from starlette.routing import Route
 
     port = int(os.environ.get("PORT", "8080"))
     mcp_app = mcp.streamable_http_app()
 
+    # Fetch the LMFDB favicon at startup so we can serve it from memory.
+    # Fall back gracefully if the fetch fails.
+    FAVICON_BYTES = b""
+    try:
+        with urllib.request.urlopen(
+            "https://www.lmfdb.org/favicon.ico", timeout=10
+        ) as resp:
+            FAVICON_BYTES = resp.read()
+        log.info("Loaded LMFDB favicon (%d bytes)", len(FAVICON_BYTES))
+    except Exception as e:
+        log.warning("Could not fetch LMFDB favicon: %s", e)
+
     LANDING_HTML = """\
 <!DOCTYPE html>
 <html>
-<head><title>LMFDB MCP Server</title></head>
+<head>
+<title>LMFDB MCP Server</title>
+<link rel="icon" href="/favicon.ico">
+</head>
 <body>
 <h1>LMFDB MCP Server</h1>
 <p>This is a <a href="https://modelcontextprotocol.io/">Model Context Protocol</a>
@@ -461,8 +477,18 @@ github.com/AndrewVSutherland/lmfdb-mcp</a></p>
     async def landing(request):
         return HTMLResponse(LANDING_HTML)
 
-    # Add the landing page to the MCP app's existing routes
+    async def favicon(request):
+        if FAVICON_BYTES:
+            return Response(
+                FAVICON_BYTES,
+                media_type="image/x-icon",
+                headers={"Cache-Control": "public, max-age=86400"},
+            )
+        return Response(status_code=404)
+
+    # Add the landing page and favicon routes to the MCP app
     mcp_app.routes.append(Route("/", landing))
-    mcp_app.middleware_stack = None  # force rebuild to pick up new route
+    mcp_app.routes.append(Route("/favicon.ico", favicon))
+    mcp_app.middleware_stack = None  # force rebuild to pick up new routes
 
     uvicorn.run(mcp_app, host="0.0.0.0", port=port)
