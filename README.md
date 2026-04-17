@@ -34,7 +34,9 @@ The code in this repository was written entirely by Claude Opus 4.6.
 | `count_rows`    | Count rows with optional WHERE clause                 |
 | `table_stats`   | Compute min/max/avg/stddev for a numeric column       |
 
-## Connecting Claude to the Server
+## Connecting Claude to the MCP server
+
+All Claude models (Haiku/Sonnet/Opus) can use tools via MCP servers.
 
 ### For Individual Users (Pro / Max / Free)
 
@@ -44,14 +46,19 @@ The code in this repository was written entirely by Claude Opus 4.6.
    - **Name:** `LMFDB`
    - **URL:** `https://mcp.lmfdb.org/mcp`
 4. Click **Add**
-5. In any conversation, click **+** → **Connectors** → enable **LMFDB**
+5. Set Read-only tools to "Always allow" (optional, lets Claude use the tool without asking permission). 
+6. In any conversation, click **+** → **Connectors** → enable **LMFDB**
 
 ### For Teams / Enterprise
 
 An organization Owner adds the connector once in **Organization Settings →
 Connectors**, and all members can then enable it per-conversation.
 
-## Connecting ChatGPT to the server
+## Connecting ChatGPT to the MCP server
+
+In ChatGPT MCP connectors are treated as "apps".  Custom apps (including the LMFDB MCP server) are not available on the Free/Go plan, as you need to enable "Developer mode" in order to install them.
+
+[Apps cannot be used in Pro models](https://help.openai.com/en/articles/11487775-connectors-in-chatgpt) (but they can be used in all other models available under the Pro plan).
 
 ### For Individual Users (Pro / Plus)
 
