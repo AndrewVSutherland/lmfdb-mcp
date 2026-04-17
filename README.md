@@ -46,7 +46,7 @@ All Claude models (Haiku/Sonnet/Opus) can use tools via MCP servers.
    - **Name:** `LMFDB`
    - **URL:** `https://mcp.lmfdb.org/mcp`
 4. Click **Add**
-5. Set Read-only tools to "Always allow" (optional, lets Claude use the tool without asking permission). 
+5. Set Read-only tools to **Always allow** (optional, lets Claude use the tool without asking permission). 
 6. In any conversation, click **+** → **Connectors** → enable **LMFDB**
 
 ### For Teams / Enterprise
@@ -56,7 +56,7 @@ Connectors**, and all members can then enable it per-conversation.
 
 ## Connecting ChatGPT to the MCP server
 
-In ChatGPT MCP connectors are treated as "apps".  Custom apps (including the LMFDB MCP server) are not available on the Free/Go plan, as you need to enable "Developer mode" in order to install them.
+In ChatGPT MCP connectors are treated as "apps".  Custom apps (including the LMFDB MCP server) are not available on the Free/Go plan, as you need to enable **Developer mode** in order to install them.
 
 [Apps cannot be used in Pro models](https://help.openai.com/en/articles/11487775-connectors-in-chatgpt) (but they can be used in all other models available under the Pro plan).
 
