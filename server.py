@@ -208,15 +208,26 @@ mcp = FastMCP(
         - The prefix indicates the mathematical area (ec = elliptic curves,
           nf = number fields, g2c = genus 2 curves, gps = groups, mf = modular
           forms, etc.)
-        - Use list_tables to discover available tables, describe_table to see
-          columns and types, and run_sql to execute arbitrary SELECT queries.
-        - For GROUP BY, JOIN, or complex aggregations, use run_sql directly
-          rather than making multiple count_rows calls.
-        - Results are limited to 100,000 rows by default.  For very large
+
+        Typical workflow for finding data:
+        1. If you know what mathematical quantity you want but not where
+           it lives, start with search_knowls (e.g. "frobenius traces",
+           "conductor", "sato-tate group"). It returns table and column
+           documentation ranked by relevance.
+        2. Use describe_table to see the schema and descriptions for a
+           specific table.
+        3. Use run_sql to execute SELECT queries. Prefer single queries
+           with GROUP BY / JOIN over multiple count_rows calls.
+
+        Other notes:
+        - Data about one mathematical object is often spread across
+          multiple tables (e.g. elliptic curves over Q use ec_curvedata,
+          ec_classdata, ec_localdata, ec_mwbsd).
+        - Results are limited to 100,000 rows by default. For very large
           datasets, use WHERE clauses and aggregations.
-        - Some tables have tens or hundreds of millions of rows.  Queries
+        - Some tables have tens or hundreds of millions of rows. Queries
           that scan full large tables (e.g. ORDER BY on unindexed columns,
-          or aggregations without WHERE clauses) may be slow.  Use targeted
+          or aggregations without WHERE clauses) may be slow. Use targeted
           WHERE clauses when possible.
     """),
 )
@@ -252,6 +263,68 @@ def list_tables(prefix: str = "") -> str:
     if "error" in result:
         return json.dumps(result)
     return json.dumps(result["rows"], default=str)
+
+
+@mcp.tool(annotations=_READ_ONLY)
+def search_knowls(query: str, limit: int = 20) -> str:
+    """
+    Search LMFDB documentation for tables and columns matching the given
+    keywords. Use this to discover which table or column contains a
+    mathematical quantity you're looking for.
+
+    This is typically the first tool to call when you know what
+    mathematical data you want but don't know where it's stored. For
+    example:
+      - search_knowls("frobenius traces") finds columns storing a_p values
+      - search_knowls("isogeny class") finds tables about isogeny classes
+      - search_knowls("rational points") finds columns with rational point data
+      - search_knowls("analytic rank") finds the relevant column(s)
+
+    Args:
+        query: One or more keywords (e.g. "frobenius traces",
+               "conductor elliptic curve", "sato-tate").
+        limit: Maximum results to return (default 20, max 100).
+    Returns:
+        JSON array of {id, title, content, match_count} objects, ranked
+        by how many query keywords match. IDs have the form
+        "tables.<table_name>" or "columns.<table_name>.<column_name>".
+    """
+    _log_tool("search_knowls", query=query, limit=limit)
+
+    # Split query into lowercase keywords; ignore very short tokens
+    keywords = [w.lower() for w in re.findall(r"\w+", query) if len(w) >= 2]
+    if not keywords:
+        return json.dumps({"error": "No searchable keywords in query."})
+
+    limit = min(max(1, limit), 100)
+
+    # Find matching knowls, sorted by number of matching keywords descending.
+    # The && operator checks array overlap (fast); the subquery counts matches.
+    sql = """
+        SELECT
+            k.id,
+            k.title,
+            k.content,
+            (SELECT COUNT(*) FROM unnest(%s::text[]) kw
+             WHERE kw = ANY(k._keywords)) AS match_count
+        FROM kwl_knowls k
+        WHERE k._keywords && %s::text[]
+          AND (k.id LIKE 'tables.%%' OR k.id LIKE 'columns.%%')
+        ORDER BY match_count DESC, k.id
+    """
+    result = run_query(sql, [keywords, keywords], limit=limit * 3)
+    if "error" in result:
+        return json.dumps(result)
+
+    # Dedupe by id, preserving order (some tables appear as duplicate rows
+    # in pg_class on the read-only mirror)
+    seen = set()
+    deduped = []
+    for row in result["rows"]:
+        if row["id"] not in seen:
+            seen.add(row["id"])
+            deduped.append(row)
+    return json.dumps(deduped[:limit], default=str)
 
 
 @mcp.tool(annotations=_READ_ONLY)
