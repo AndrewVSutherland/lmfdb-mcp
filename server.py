@@ -154,7 +154,10 @@ def run_query(sql: str, params: list | None = None, limit: int | None = None) ->
     try:
         conn = get_connection()
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(sql, params or [])
+            # Pass None (not []) when there are no parameters, so psycopg2
+            # skips %-substitution and bare % characters (e.g. in LIKE
+            # patterns) are treated literally.
+            cur.execute(sql, params if params else None)
             rows = cur.fetchall()
             columns = [desc[0] for desc in cur.description] if cur.description else []
             return {
@@ -254,19 +257,30 @@ def list_tables(prefix: str = "") -> str:
 @mcp.tool(annotations=_READ_ONLY)
 def describe_table(table_name: str) -> str:
     """
-    Show the column names and types for a given LMFDB table.
-    For array columns, reports the full type (e.g. "integer[]").
+    Show the column names, types, and (where available) documentation
+    for a given LMFDB table.
+
+    The output includes:
+      - table_name, row_estimate
+      - description: the contents of the knowl "tables.<table_name>", if any,
+        describing what the table represents
+      - columns: a list of {column_name, data_type, is_nullable, description}
+        objects, where "description" comes from the knowl
+        "columns.<table_name>.<column_name>", if any
+
+    Knowl content may contain LaTeX, markdown, and nested knowl references.
 
     Args:
         table_name: The table to describe (e.g. "ec_curvedata", "g2c_curves").
     Returns:
-        JSON array of {column_name, data_type, is_nullable} objects.
+        JSON object with keys: table_name, description, columns.
     """
     _log_tool("describe_table", table_name=table_name)
     if not _validate_identifier(table_name):
         return json.dumps({"error": "Invalid table name."})
 
-    sql = """
+    # Columns from pg_catalog
+    cols_sql = """
         SELECT a.attname AS column_name,
                pg_catalog.format_type(a.atttypid, a.atttypmod) AS data_type,
                CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END AS is_nullable
@@ -279,12 +293,40 @@ def describe_table(table_name: str) -> str:
           AND NOT a.attisdropped
         ORDER BY a.attnum
     """
-    result = run_query(sql, [table_name], limit=500)
-    if "error" in result:
-        return json.dumps(result)
-    if not result["rows"]:
+    cols_result = run_query(cols_sql, [table_name], limit=500)
+    if "error" in cols_result:
+        return json.dumps(cols_result)
+    if not cols_result["rows"]:
         return json.dumps({"error": f"Table '{table_name}' not found."})
-    return json.dumps(result["rows"], default=str)
+
+    # Knowls: table-level and all column-level in one query
+    knowl_sql = """
+        SELECT id, content FROM kwl_knowls
+        WHERE id = %s OR id LIKE %s
+    """
+    table_knowl_id = f"tables.{table_name}"
+    column_knowl_prefix = f"columns.{table_name}.%"
+    knowl_result = run_query(
+        knowl_sql, [table_knowl_id, column_knowl_prefix], limit=500
+    )
+    knowls = {}
+    if "error" not in knowl_result:
+        knowls = {row["id"]: row["content"] for row in knowl_result["rows"]}
+
+    # Attach descriptions to columns
+    columns = []
+    for col in cols_result["rows"]:
+        col["description"] = knowls.get(
+            f"columns.{table_name}.{col['column_name']}"
+        )
+        columns.append(col)
+
+    output = {
+        "table_name": table_name,
+        "description": knowls.get(table_knowl_id),
+        "columns": columns,
+    }
+    return json.dumps(output, default=str)
 
 
 @mcp.tool(annotations=_READ_ONLY)
