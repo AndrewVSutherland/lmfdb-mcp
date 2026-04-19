@@ -29,6 +29,7 @@ The code in this repository was written entirely by Claude Opus 4.6.
 |:----------------|:------------------------------------------------------|
 | `list_tables`   | List all tables, optionally filtered by prefix        |
 | `describe_table`| Show column names and types for a table               |
+| `search_knowls` | Search table/column knowls using keywords             |
 | `sample_rows`   | Return a small sample from a table                    |
 | `run_sql`       | Run an arbitrary SELECT query (max 100,000 rows)      |
 | `count_rows`    | Count rows with optional WHERE clause                 |
