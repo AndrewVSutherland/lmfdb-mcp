@@ -300,31 +300,31 @@ def search_knowls(query: str, limit: int = 20) -> str:
 
     # Find matching knowls, sorted by number of matching keywords descending.
     # The && operator checks array overlap (fast); the subquery counts matches.
+    # kwl_knowls keeps a full revision history per id (like wikipedia), so we
+    # use DISTINCT ON + ORDER BY timestamp DESC in a CTE to restrict to the
+    # latest revision of each knowl before scoring and ranking.
     sql = """
+        WITH latest AS (
+            SELECT DISTINCT ON (id) id, title, content, _keywords
+            FROM kwl_knowls
+            WHERE _keywords && %s::text[]
+              AND (id LIKE 'tables.%%' OR id LIKE 'columns.%%')
+            ORDER BY id, timestamp DESC
+        )
         SELECT
-            k.id,
-            k.title,
-            k.content,
+            id,
+            title,
+            content,
             (SELECT COUNT(*) FROM unnest(%s::text[]) kw
-             WHERE kw = ANY(k._keywords)) AS match_count
-        FROM kwl_knowls k
-        WHERE k._keywords && %s::text[]
-          AND (k.id LIKE 'tables.%%' OR k.id LIKE 'columns.%%')
-        ORDER BY match_count DESC, k.id
+             WHERE kw = ANY(_keywords)) AS match_count
+        FROM latest
+        ORDER BY match_count DESC, id
     """
-    result = run_query(sql, [keywords, keywords], limit=limit * 3)
+    result = run_query(sql, [keywords, keywords], limit=limit)
     if "error" in result:
         return json.dumps(result)
 
-    # Dedupe by id, preserving order (some tables appear as duplicate rows
-    # in pg_class on the read-only mirror)
-    seen = set()
-    deduped = []
-    for row in result["rows"]:
-        if row["id"] not in seen:
-            seen.add(row["id"])
-            deduped.append(row)
-    return json.dumps(deduped[:limit], default=str)
+    return json.dumps(result["rows"], default=str)
 
 
 @mcp.tool(annotations=_READ_ONLY)
@@ -375,10 +375,13 @@ def describe_table(table_name: str) -> str:
     if not cols_result["rows"]:
         return json.dumps({"error": f"Table '{table_name}' not found."})
 
-    # Knowls: table-level and all column-level in one query
+    # Knowls: table-level and all column-level in one query.
+    # kwl_knowls keeps a full revision history per id (like wikipedia),
+    # so DISTINCT ON + ORDER BY timestamp DESC selects the latest revision.
     knowl_sql = """
-        SELECT id, content FROM kwl_knowls
+        SELECT DISTINCT ON (id) id, content FROM kwl_knowls
         WHERE id = %s OR id LIKE %s
+        ORDER BY id, timestamp DESC
     """
     table_knowl_id = f"tables.{table_name}"
     column_knowl_prefix = f"columns.{table_name}.%"
