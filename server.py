@@ -334,12 +334,15 @@ def describe_table(table_name: str) -> str:
     for a given LMFDB table.
 
     The output includes:
-      - table_name, row_estimate
+      - table_name
       - description: the contents of the knowl "tables.<table_name>", if any,
         describing what the table represents
-      - columns: a list of {column_name, data_type, is_nullable, description}
-        objects, where "description" comes from the knowl
-        "columns.<table_name>.<column_name>", if any
+      - columns: a list of {column_name, data_type, is_nullable, description,
+        array_length} objects. "description" comes from the knowl
+        "columns.<table_name>.<column_name>", if any. "array_length" is
+        present for array-typed columns and reports the typical length
+        sampled from a few rows (useful for columns that store a fixed
+        number of values, e.g. aplist has length 25 for a_p with p < 100).
 
     Knowl content may contain LaTeX, markdown, and nested knowl references.
 
@@ -386,12 +389,40 @@ def describe_table(table_name: str) -> str:
     if "error" not in knowl_result:
         knowls = {row["id"]: row["content"] for row in knowl_result["rows"]}
 
-    # Attach descriptions to columns
+    # For array columns, sample a few rows to report typical length.
+    # This surfaces information that is often critical (e.g. "aplist"
+    # contains 25 values — a_p for the primes < 100).
+    array_cols = [
+        c["column_name"] for c in cols_result["rows"]
+        if c["data_type"].endswith("[]")
+    ]
+    array_lengths = {}
+    if array_cols:
+        length_exprs = ", ".join(
+            f'array_length("{c}", 1) AS "{c}"' for c in array_cols
+        )
+        sample_sql = f'SELECT {length_exprs} FROM "{table_name}" LIMIT 5'
+        sample_result = run_query(sample_sql, limit=5)
+        if "error" not in sample_result and sample_result["rows"]:
+            for col in array_cols:
+                values = [r[col] for r in sample_result["rows"] if r[col] is not None]
+                if not values:
+                    array_lengths[col] = None
+                elif all(v == values[0] for v in values):
+                    array_lengths[col] = f"length: {values[0]}"
+                else:
+                    array_lengths[col] = (
+                        f"length: variable (sample: {min(values)}–{max(values)})"
+                    )
+
+    # Attach descriptions and array-length hints to columns
     columns = []
     for col in cols_result["rows"]:
         col["description"] = knowls.get(
             f"columns.{table_name}.{col['column_name']}"
         )
+        if col["column_name"] in array_lengths:
+            col["array_length"] = array_lengths[col["column_name"]]
         columns.append(col)
 
     output = {
