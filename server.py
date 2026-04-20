@@ -290,13 +290,35 @@ def _fetch_metadata() -> list:
 @mcp.tool(annotations=_READ_ONLY)
 def overview() -> str:
     """
-    Return a curated, sectioned map of the LMFDB production tables.
+    Curated map of the LMFDB (L-functions and Modular Forms Database)
+    by mathematical area — ALWAYS CALL THIS FIRST for any task
+    involving number theory data.
 
-    This is the recommended starting point for any new task. For each
-    mathematical section (e.g. "Elliptic curves over Q"), it lists the
-    relevant tables with notes identifying the hub table, the grain
-    (per-curve, per-isogeny-class, etc.), typical join columns, and any
-    format quirks.
+    Covers these mathematical areas: elliptic curves over Q and over
+    number fields, classical modular forms, Maass forms, Hilbert
+    modular forms, Bianchi modular forms, genus 2 curves, higher
+    genus families, L-functions, number fields, p-adic fields,
+    Dirichlet characters, Artin representations, Galois groups,
+    Sato-Tate groups, abstract groups, abelian varieties over finite
+    fields, Belyi maps.
+
+    Returns a sectioned JSON map of production tables grouped by
+    mathematical area, with for each table:
+      - the hub table of each section (the table to start joins from)
+      - grain of each table (per-curve, per-isogeny-class, etc.)
+      - canonical join columns (often the key to avoiding wrong joins)
+      - format quirks where present
+
+    Use this BEFORE search_knowls / describe_table / list_tables — it
+    usually shortcuts the whole discovery workflow. Follow up with:
+      - search_knowls(keywords): find the column storing a specific
+        mathematical quantity when overview doesn't already tell you
+      - describe_table(name): see the full schema of a specific table
+      - run_sql(query): execute a SELECT query
+      - count_rows, sample_rows, table_stats: convenience wrappers
+        for common operations without writing SQL
+
+    Takes no arguments.
 
     Returns:
         JSON object with shape:
@@ -342,6 +364,11 @@ def list_tables(prefix: str = "", status: str = "production") -> str:
     """
     List LMFDB tables with metadata (section, notes) when available.
 
+    If you're starting a new task, prefer overview() — it gives the same
+    metadata grouped by mathematical area and is usually more useful.
+    Use list_tables when you need a flat list or when filtering by a
+    prefix you already know.
+
     By default returns only production tables flagged visible through the
     MCP (status='production', mcp_visible=true in the lmfdb_tables
     metadata). Pass status='all' to also include tables that are not
@@ -353,9 +380,16 @@ def list_tables(prefix: str = "", status: str = "production") -> str:
     are always filtered out.
 
     Args:
-        prefix: Optional prefix to filter tables (e.g. "ec" for elliptic
-                curves, "nf" for number fields, "g2c" for genus 2 curves,
-                "gps" for groups, "mf" for modular forms).
+        prefix: Optional table-name prefix. Common prefixes:
+          ec (elliptic curves over Q), ec_nf (elliptic curves over
+          number fields), nf (number fields), lf (p-adic fields),
+          mf (classical modular forms), hmf (Hilbert modular forms),
+          bmf (Bianchi modular forms), maass (Maass forms),
+          g2c (genus 2 curves), hgcwa (higher genus families),
+          av_fq (abelian varieties over Fq), belyi (Belyi maps),
+          lfunc (L-functions), char (Dirichlet characters),
+          artin (Artin representations), gps (groups — abstract,
+          Galois, Sato-Tate).
         status: 'production' (default) returns only production-visible
                 tables. 'all' returns every matching table including
                 uncurated ones. Other values ('beta', 'alpha', 'obsolete')
