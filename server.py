@@ -46,6 +46,22 @@ DB_PASS = os.environ.get("LMFDB_PASSWORD", "lmfdb")
 MAX_ROWS = int(os.environ.get("LMFDB_MAX_ROWS", "100000"))
 DEFAULT_LIMIT = int(os.environ.get("LMFDB_DEFAULT_LIMIT", "100"))
 
+# Export / bulk download config. Exports stream results to a download URL
+# instead of returning them through the MCP tool response, so the row cap
+# can be much higher than MAX_ROWS (which is bounded by what fits in an
+# LLM's context window).
+EXPORT_MAX_ROWS = int(os.environ.get("LMFDB_EXPORT_MAX_ROWS", "1000000"))
+EXPORT_DEFAULT_ROWS = int(os.environ.get("LMFDB_EXPORT_DEFAULT_ROWS", "100000"))
+EXPORT_TOKEN_TTL = int(os.environ.get("LMFDB_EXPORT_TOKEN_TTL", "600"))  # seconds
+EXPORT_MAX_TOKENS = int(os.environ.get("LMFDB_EXPORT_MAX_TOKENS", "1000"))
+
+# Public base URL for download links. In production this should be set to
+# the externally-visible URL of this server (e.g. https://mcp.lmfdb.org).
+# If unset, we fall back to a value derived from the request host at
+# download time, which works for local testing but not behind load balancers
+# without X-Forwarded-* handling.
+MCP_BASE_URL = os.environ.get("MCP_BASE_URL", "").rstrip("/")
+
 # ---------------------------------------------------------------------------
 # Database helpers
 # ---------------------------------------------------------------------------
@@ -224,6 +240,16 @@ mcp = FastMCP(
         4. run_sql(sql) — prefer single queries with GROUP BY / JOIN over
            multiple count_rows calls.
 
+        For bulk downloads destined for client-side analysis (pandas,
+        numpy, plotting, ML), use export_query(sql, format) INSTEAD of
+        run_sql. It returns a short-lived download URL, keeping the data
+        out of the conversation entirely — so it can return far more rows
+        than run_sql's 100,000 cap. Typical pattern:
+            result = export_query("SELECT ... FROM ec_curvedata WHERE ...")
+            # in a sandbox / code-execution environment:
+            import pandas as pd
+            df = pd.read_csv(result["url"])
+
         Canonical joins — elliptic curves over Q:
           ec_curvedata <-> ec_mwbsd / ec_galrep / ec_iwasawa : ON lmfdb_label (1:1)
           ec_curvedata <-> ec_localdata / ec_torsion_growth  : ON lmfdb_label (1:N)
@@ -285,6 +311,102 @@ def _fetch_metadata() -> list:
         _metadata_cache["rows"] = rows
         _metadata_cache["fetched_at"] = now
     return rows
+
+
+# ---------------------------------------------------------------------------
+# Export token store
+# ---------------------------------------------------------------------------
+# export_query() registers a validated SELECT along with a format, returning
+# a short-lived opaque token. The /download/<token> endpoint later looks up
+# the SQL by token, streams the result set as CSV or JSONL, and discards
+# the token on expiry. Tokens are stateful and process-local; with Cloud Run
+# min-instances=1 and our expected traffic, cross-instance routing hasn't
+# been an issue. A restart loses pending tokens; clients should retry.
+
+import secrets
+import time as _time
+
+_export_tokens: dict = {}
+_export_tokens_lock = threading.Lock()
+
+
+def _prune_expired_tokens(now: float | None = None) -> None:
+    """Drop any tokens whose expires_at is in the past. Caller holds the lock."""
+    if now is None:
+        now = _time.time()
+    expired = [t for t, rec in _export_tokens.items() if rec["expires_at"] <= now]
+    for t in expired:
+        del _export_tokens[t]
+
+
+def _register_export(sql: str, fmt: str, max_rows: int) -> dict:
+    """
+    Register a validated SELECT query for later streaming. Returns a dict
+    with token, expires_at, and other metadata. Raises RuntimeError if
+    the token store is full.
+    """
+    now = _time.time()
+    token = secrets.token_urlsafe(24)
+    record = {
+        "sql": sql,
+        "format": fmt,
+        "max_rows": max_rows,
+        "created_at": now,
+        "expires_at": now + EXPORT_TOKEN_TTL,
+    }
+    with _export_tokens_lock:
+        _prune_expired_tokens(now)
+        if len(_export_tokens) >= EXPORT_MAX_TOKENS:
+            raise RuntimeError(
+                "Export token store is full; try again in a few minutes."
+            )
+        _export_tokens[token] = record
+    return {"token": token, **record}
+
+
+def _lookup_export(token: str) -> dict | None:
+    """Return the SQL/format record for a token, or None if missing/expired."""
+    now = _time.time()
+    with _export_tokens_lock:
+        rec = _export_tokens.get(token)
+        if rec is None:
+            return None
+        if rec["expires_at"] <= now:
+            del _export_tokens[token]
+            return None
+        return dict(rec)  # return a copy
+
+
+# LIMIT-handling helper specifically for export queries. The regular
+# run_query() caps LIMITs at MAX_ROWS; for exports we use EXPORT_MAX_ROWS
+# instead. Same shape as the logic in run_query().
+def _apply_export_limit(sql: str, requested_limit: int) -> str:
+    """Return sql with a LIMIT clause that respects EXPORT_MAX_ROWS."""
+    clean = sql.strip().rstrip(";").rstrip()
+    effective = min(max(1, requested_limit), EXPORT_MAX_ROWS)
+    match = _LIMIT_RE.search(clean)
+    if match:
+        user_limit = int(match.group(1))
+        capped = min(user_limit, EXPORT_MAX_ROWS)
+        offset_part = match.group(2) or ""
+        return clean[: match.start()] + f"LIMIT {capped}{offset_part}"
+    return clean + f" LIMIT {effective}"
+
+
+def _estimate_row_count(sql: str) -> int | None:
+    """
+    Run EXPLAIN (FORMAT JSON) <sql> and return the top-level row estimate.
+    Returns None on failure; the caller can proceed without an estimate.
+    """
+    try:
+        conn = get_connection()
+        with conn.cursor() as cur:
+            cur.execute(f"EXPLAIN (FORMAT JSON) {sql}")
+            plan = cur.fetchone()[0]
+            return int(plan[0]["Plan"]["Plan Rows"])
+    except Exception as e:
+        log.info("EXPLAIN failed for export row estimate: %s", e)
+        return None
 
 
 @mcp.tool(annotations=_READ_ONLY)
@@ -758,13 +880,128 @@ def table_stats(table_name: str, column: str, where: str = "") -> str:
     return json.dumps(result["rows"][0] if result["rows"] else {}, default=str)
 
 
+@mcp.tool(annotations=_READ_ONLY)
+def export_query(
+    sql: str,
+    format: str = "csv",
+    max_rows: int = EXPORT_DEFAULT_ROWS,
+) -> str:
+    """
+    Prepare a bulk download of a SELECT query's results. Returns a short-
+    lived URL that streams the full result set as CSV or JSONL — the data
+    does NOT go through the MCP conversation, so this is the right tool
+    for anything destined for client-side analysis (pandas, numpy, plots,
+    machine learning, etc.) rather than direct inspection.
+
+    Typical use: ask the LLM to write a query joining several tables and
+    selecting the columns you want, call export_query, then in the LLM's
+    code-execution sandbox:
+
+        import pandas as pd
+        df = pd.read_csv("<returned url>")
+        # or for JSONL:
+        # df = pd.read_json("<returned url>", lines=True)
+        ... analysis ...
+
+    Compared to run_sql:
+      - run_sql returns rows inline (capped at 100,000, meant for direct
+        inspection; everything flows through the LLM's context window).
+      - export_query returns a URL (default cap 100,000 rows, hard cap
+        1,000,000; data bypasses the LLM's context entirely).
+
+    The download URL is valid for about 10 minutes and can be fetched
+    multiple times within that window. Only SELECT / WITH / EXPLAIN
+    queries are allowed (same safety rules as run_sql).
+
+    Args:
+        sql: A SELECT query. Same rules as run_sql.
+        format: 'csv' (default, universal, types coerced to strings) or
+                'jsonl' (JSON Lines; preserves types; pandas reads via
+                pd.read_json(url, lines=True)).
+        max_rows: Maximum rows to export (default 100,000, hard cap
+                  1,000,000). If the query has its own LIMIT, the smaller
+                  of the two is used.
+
+    Returns:
+        JSON object:
+          {
+            "url": "https://.../download/<token>",
+            "format": "csv",
+            "estimated_rows": 84321,       # from EXPLAIN; may be null
+            "max_rows": 100000,            # cap actually applied
+            "expires_in_seconds": 600,
+            "sandbox_hint": "import pandas as pd; df = pd.read_csv(url)"
+          }
+        Or {"error": "..."} on failure.
+    """
+    _log_tool("export_query", sql=sql[:1000], format=format, max_rows=max_rows)
+
+    # Format validation
+    fmt = format.lower()
+    if fmt not in ("csv", "jsonl"):
+        return json.dumps({
+            "error": "format must be 'csv' or 'jsonl'.",
+        })
+
+    # SQL validation — mirror run_query's checks (SELECT-only, blocklist,
+    # single statement).
+    stripped = sql.strip()
+    keyword = stripped.split()[0].upper() if stripped else ""
+    if keyword not in ("SELECT", "WITH", "EXPLAIN"):
+        return json.dumps({
+            "error": "Only SELECT / WITH / EXPLAIN queries can be exported.",
+        })
+    blocked = _check_blocked(stripped)
+    if blocked:
+        return json.dumps({"error": blocked})
+
+    # Apply the export-specific LIMIT cap.
+    try:
+        requested = int(max_rows)
+    except (TypeError, ValueError):
+        return json.dumps({"error": "max_rows must be an integer."})
+    if requested < 1:
+        return json.dumps({"error": "max_rows must be >= 1."})
+    bounded_sql = _apply_export_limit(stripped, requested)
+
+    # Cheap planner-based row estimate (not exact — could be off by an
+    # order of magnitude for complex joins, but useful for orientation).
+    estimated = _estimate_row_count(bounded_sql)
+
+    # Register the token.
+    try:
+        rec = _register_export(bounded_sql, fmt, requested)
+    except RuntimeError as e:
+        return json.dumps({"error": str(e)})
+
+    # Build the public URL. MCP_BASE_URL is preferred; otherwise the
+    # caller must use a relative path (unusual for an LLM-facing tool).
+    base = MCP_BASE_URL or "https://mcp.lmfdb.org"
+    url = f"{base}/download/{rec['token']}"
+
+    hint = (
+        'import pandas as pd; df = pd.read_csv(url)'
+        if fmt == "csv"
+        else 'import pandas as pd; df = pd.read_json(url, lines=True)'
+    )
+
+    return json.dumps({
+        "url": url,
+        "format": fmt,
+        "estimated_rows": estimated,
+        "max_rows": min(requested, EXPORT_MAX_ROWS),
+        "expires_in_seconds": EXPORT_TOKEN_TTL,
+        "sandbox_hint": hint,
+    })
+
+
 # ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import urllib.request
     import uvicorn
-    from starlette.responses import HTMLResponse, Response
+    from starlette.responses import HTMLResponse, Response, StreamingResponse
     from starlette.routing import Route
 
     port = int(os.environ.get("PORT", "8080"))
@@ -818,9 +1055,107 @@ github.com/AndrewVSutherland/lmfdb-mcp</a></p>
             )
         return Response(status_code=404)
 
-    # Add the landing page and favicon routes to the MCP app
+    # ----- /download/<token> -----------------------------------------------
+    # Streams the result set of a registered export query as CSV or JSONL.
+    # The query is run on a fresh connection with a server-side named cursor
+    # so that very large result sets don't materialize in server memory.
+    def _stream_rows(sql: str, fmt: str, token: str):
+        """Sync generator yielding encoded chunks. Run by Starlette's
+        threadpool (StreamingResponse handles sync iterables)."""
+        import csv
+        import io
+
+        # Fresh connection for streaming — distinct from the shared one in
+        # get_connection(), because server-side cursors require a transaction
+        # (we can't use autocommit) and we don't want to disturb interactive
+        # queries that share the cached connection.
+        conn = None
+        try:
+            conn = psycopg2.connect(
+                host=DB_HOST,
+                port=DB_PORT,
+                dbname=DB_NAME,
+                user=DB_USER,
+                password=DB_PASS,
+                connect_timeout=30,
+                options="-c statement_timeout=600000",  # 10 min for exports
+            )
+            # Named cursor -> PostgreSQL server-side cursor (streamed fetch).
+            cursor_name = f"mcp_export_{token[:16]}"
+            with conn.cursor(name=cursor_name) as cur:
+                cur.itersize = 10000  # rows per network roundtrip
+                cur.execute(sql)
+                columns = [desc[0] for desc in cur.description]
+
+                if fmt == "csv":
+                    header_buf = io.StringIO()
+                    csv.writer(header_buf).writerow(columns)
+                    yield header_buf.getvalue().encode("utf-8")
+                    for row in cur:
+                        buf = io.StringIO()
+                        # csv.writer coerces everything via str(); None
+                        # becomes empty string, which is the CSV convention.
+                        csv.writer(buf).writerow(
+                            ["" if v is None else v for v in row]
+                        )
+                        yield buf.getvalue().encode("utf-8")
+                else:  # jsonl
+                    for row in cur:
+                        obj = {col: row[i] for i, col in enumerate(columns)}
+                        yield (json.dumps(obj, default=str) + "\n").encode("utf-8")
+        except Exception as e:
+            log.error("export stream failed for token=%s: %s", token[:8], e)
+            # We've likely already started sending the response; we can't
+            # cleanly propagate an error. Emit a comment-ish trailing line
+            # so anyone reading the file at least sees something went wrong.
+            if fmt == "csv":
+                yield f"\n# export failed mid-stream: {e}\n".encode("utf-8")
+            else:
+                yield (json.dumps({"_error": str(e)}) + "\n").encode("utf-8")
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    async def download(request):
+        token = request.path_params.get("token", "")
+        rec = _lookup_export(token)
+        if rec is None:
+            return Response(
+                "Download token not found or expired.",
+                status_code=404,
+                media_type="text/plain",
+            )
+
+        fmt = rec["format"]
+        sql = rec["sql"]
+        log.info(
+            "tool=download token=%s... fmt=%s",
+            token[:8], fmt,
+        )
+
+        if fmt == "csv":
+            media_type = "text/csv"
+            filename = f"lmfdb-export-{token[:8]}.csv"
+        else:
+            media_type = "application/x-ndjson"
+            filename = f"lmfdb-export-{token[:8]}.jsonl"
+
+        return StreamingResponse(
+            _stream_rows(sql, fmt, token),
+            media_type=media_type,
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Cache-Control": "no-store",
+            },
+        )
+
+    # Add the landing page, favicon, and download routes to the MCP app.
     mcp_app.routes.append(Route("/", landing))
     mcp_app.routes.append(Route("/favicon.ico", favicon))
+    mcp_app.routes.append(Route("/download/{token}", download))
     mcp_app.middleware_stack = None  # force rebuild to pick up new routes
 
     uvicorn.run(mcp_app, host="0.0.0.0", port=port)
