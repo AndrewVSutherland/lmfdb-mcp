@@ -27,7 +27,8 @@ The code in this repository was written entirely by Claude Opus 4.6.
 
 | Tool            | Description                                           |
 |:----------------|:------------------------------------------------------|
-| `list_tables`   | List all tables, optionally filtered by prefix        |
+| `overview`      | Overview of LMFDB sections and tables                 |
+| `list_tables`   | Curated list of tables, optionally filtered by prefix |
 | `describe_table`| Show column names and types for a table               |
 | `search_knowls` | Search table/column knowls using keywords             |
 | `sample_rows`   | Return a small sample from a table                    |
