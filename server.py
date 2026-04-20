@@ -203,26 +203,44 @@ mcp = FastMCP(
         Use the tools below to explore tables, inspect schemas, and run SQL
         queries against the read-only PostgreSQL mirror of the LMFDB.
 
-        Key conventions:
+        Orientation:
+        - Call overview() first to see a curated map of the production tables
+          grouped by mathematical section, with a hub table identified per
+          section and notes on grain and joins. This is almost always the
+          fastest path from a question to the right table.
         - Table names use underscores: ec_curvedata, nf_fields, g2c_curves, etc.
-        - The prefix indicates the mathematical area (ec = elliptic curves,
+          The prefix indicates the mathematical area (ec = elliptic curves,
           nf = number fields, g2c = genus 2 curves, gps = groups, mf = modular
-          forms, etc.)
+          forms, lfunc = L-functions, etc.)
 
-        Typical workflow for finding data:
-        1. If you know what mathematical quantity you want but not where
-           it lives, start with search_knowls (e.g. "frobenius traces",
-           "conductor", "sato-tate group"). It returns table and column
-           documentation ranked by relevance.
-        2. Use describe_table to see the schema and descriptions for a
-           specific table.
-        3. Use run_sql to execute SELECT queries. Prefer single queries
-           with GROUP BY / JOIN over multiple count_rows calls.
+        Typical workflow:
+        1. overview() — which section covers what you need, and which table
+           is the hub for that section.
+        2. search_knowls(keywords) — if overview() doesn't obviously answer
+           "which column stores X", search documentation for the column
+           (e.g. "frobenius traces", "conductor", "sato-tate group").
+        3. describe_table(name) — confirm columns, types, and column-level
+           descriptions before writing SQL.
+        4. run_sql(sql) — prefer single queries with GROUP BY / JOIN over
+           multiple count_rows calls.
+
+        Canonical joins — elliptic curves over Q:
+          ec_curvedata <-> ec_mwbsd / ec_galrep / ec_iwasawa : ON lmfdb_label (1:1)
+          ec_curvedata <-> ec_localdata / ec_torsion_growth  : ON lmfdb_label (1:N)
+          ec_curvedata <-> ec_classdata                      : ON lmfdb_iso  (N:1)
+        ec_classdata is keyed by isogeny class (lmfdb_iso) and has no
+        lmfdb_label column — always route curve-level joins through
+        ec_curvedata. Rank is in ec_curvedata.rank (Mordell-Weil rank).
+
+        Canonical joins — genus 2 curves over Q:
+          g2c_curves <-> g2c_endomorphisms / g2c_ratpts / g2c_tamagawa : ON label
+          g2c_curves <-> g2c_galrep                                    : ON lmfdb_label
+        Note the quirk: g2c_galrep uses lmfdb_label while the other g2c_*
+        tables use label for the same identifier.
 
         Other notes:
-        - Data about one mathematical object is often spread across
-          multiple tables (e.g. elliptic curves over Q use ec_curvedata,
-          ec_classdata, ec_localdata, ec_mwbsd).
+        - Data about one mathematical object is often spread across multiple
+          tables; see overview() for the per-section breakdown.
         - Results are limited to 100,000 rows by default. For very large
           datasets, use WHERE clauses and aggregations.
         - Some tables have tens or hundreds of millions of rows. Queries
@@ -233,27 +251,134 @@ mcp = FastMCP(
 )
 
 
+# ---------------------------------------------------------------------------
+# lmfdb_tables metadata cache
+# ---------------------------------------------------------------------------
+# Curated metadata about LMFDB tables lives in the lmfdb_tables table
+# (name, section, status, mcp_visible, notes). We cache it in memory for
+# _METADATA_TTL seconds so list_tables() and overview() don't do a DB
+# roundtrip on every call, but so curation updates propagate promptly.
+
+_METADATA_TTL = 300  # seconds
+_metadata_cache = {"rows": None, "fetched_at": 0.0}
+_metadata_lock = threading.Lock()
+
+
+def _fetch_metadata() -> list:
+    """Return a list of dicts from lmfdb_tables, using a short-TTL cache."""
+    import time
+    now = time.time()
+    with _metadata_lock:
+        if (
+            _metadata_cache["rows"] is not None
+            and now - _metadata_cache["fetched_at"] < _METADATA_TTL
+        ):
+            return _metadata_cache["rows"]
+    # Fetch outside the lock (DB call); last-write-wins on concurrent refresh.
+    result = run_query(
+        "SELECT id, name, section, status, mcp_visible, notes "
+        "FROM lmfdb_tables ORDER BY id",
+        limit=1000,
+    )
+    rows = result.get("rows", []) if "error" not in result else []
+    with _metadata_lock:
+        _metadata_cache["rows"] = rows
+        _metadata_cache["fetched_at"] = now
+    return rows
+
+
 @mcp.tool(annotations=_READ_ONLY)
-def list_tables(prefix: str = "") -> str:
+def overview() -> str:
     """
-    List all available tables in the LMFDB database.
+    Return a curated, sectioned map of the LMFDB production tables.
+
+    This is the recommended starting point for any new task. For each
+    mathematical section (e.g. "Elliptic curves over Q"), it lists the
+    relevant tables with notes identifying the hub table, the grain
+    (per-curve, per-isogeny-class, etc.), typical join columns, and any
+    format quirks.
+
+    Returns:
+        JSON object with shape:
+          {
+            "sections": [
+              {
+                "section": "Elliptic curves over Q",
+                "tables": [
+                  {"name": "ec_curvedata", "notes": "Hub table ..."},
+                  ...
+                ]
+              },
+              ...
+            ]
+          }
+    """
+    _log_tool("overview")
+    rows = _fetch_metadata()
+    # Keep only production + mcp_visible rows for the overview output.
+    visible = [
+        r for r in rows
+        if r.get("status") == "production" and r.get("mcp_visible")
+    ]
+    sections = {}
+    section_order = []  # preserve first-seen order (which matches id order)
+    for r in visible:
+        sec = r["section"]
+        if sec not in sections:
+            sections[sec] = []
+            section_order.append(sec)
+        sections[sec].append({"name": r["name"], "notes": r["notes"]})
+    output = {
+        "sections": [
+            {"section": sec, "tables": sections[sec]}
+            for sec in section_order
+        ]
+    }
+    return json.dumps(output, default=str)
+
+
+@mcp.tool(annotations=_READ_ONLY)
+def list_tables(prefix: str = "", status: str = "production") -> str:
+    """
+    List LMFDB tables with metadata (section, notes) when available.
+
+    By default returns only production tables flagged visible through the
+    MCP (status='production', mcp_visible=true in the lmfdb_tables
+    metadata). Pass status='all' to also include tables that are not
+    curated (test tables, beta tables, obsolete variants, etc.) — useful
+    for developers and researchers who want access to work-in-progress
+    data.
+
+    Auxiliary tables ending in _counts or _stats (psycodict machinery)
+    are always filtered out.
 
     Args:
         prefix: Optional prefix to filter tables (e.g. "ec" for elliptic
                 curves, "nf" for number fields, "g2c" for genus 2 curves,
                 "gps" for groups, "mf" for modular forms).
+        status: 'production' (default) returns only production-visible
+                tables. 'all' returns every matching table including
+                uncurated ones. Other values ('beta', 'alpha', 'obsolete')
+                filter by that exact status value in lmfdb_tables.
+
     Returns:
-        JSON array of {table_name, row_estimate} objects.
+        JSON array of {table_name, section, row_estimate, notes} objects.
+        section and notes are null for tables not present in lmfdb_tables.
     """
-    _log_tool("list_tables", prefix=prefix)
+    _log_tool("list_tables", prefix=prefix, status=status)
+
+    # Pull physical tables from pg_class (authoritative for existence and
+    # row estimates).
     sql = """
         SELECT c.relname AS table_name,
                c.reltuples::bigint AS row_estimate
         FROM pg_class c
         JOIN pg_namespace n ON n.oid = c.relnamespace
         WHERE n.nspname = 'public' AND c.relkind = 'r'
+          AND c.relname NOT LIKE %s
+          AND c.relname NOT LIKE %s
     """
-    params = []
+    params = ["%_counts", "%_stats"]
     if prefix:
         sql += " AND c.relname LIKE %s"
         params.append(f"{prefix}%")
@@ -262,7 +387,31 @@ def list_tables(prefix: str = "") -> str:
     result = run_query(sql, params, limit=1000)
     if "error" in result:
         return json.dumps(result)
-    return json.dumps(result["rows"], default=str)
+
+    # Enrich with metadata from lmfdb_tables and apply status filter.
+    metadata = {r["name"]: r for r in _fetch_metadata()}
+    output = []
+    for row in result["rows"]:
+        meta = metadata.get(row["table_name"])
+        if status == "all":
+            # No filter; include everything, curated or not.
+            pass
+        elif status == "production":
+            # Default: require curated + production-visible.
+            if not meta or meta.get("status") != "production" \
+                    or not meta.get("mcp_visible"):
+                continue
+        else:
+            # Exact-match filter on a specific status value.
+            if not meta or meta.get("status") != status:
+                continue
+        output.append({
+            "table_name": row["table_name"],
+            "row_estimate": row["row_estimate"],
+            "section": meta["section"] if meta else None,
+            "notes": meta["notes"] if meta else None,
+        })
+    return json.dumps(output, default=str)
 
 
 @mcp.tool(annotations=_READ_ONLY)
