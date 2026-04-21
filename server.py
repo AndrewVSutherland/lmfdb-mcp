@@ -1085,13 +1085,26 @@ github.com/AndrewVSutherland/lmfdb-mcp</a></p>
             with conn.cursor(name=cursor_name) as cur:
                 cur.itersize = 10000  # rows per network roundtrip
                 cur.execute(sql)
-                columns = [desc[0] for desc in cur.description]
+
+                # psycopg2 named cursors: execute() issues DECLARE, which
+                # returns no row description. cur.description is None until
+                # the first FETCH, so we pull the first batch before reading
+                # it. We then stream that batch followed by the remainder.
+                first_batch = cur.fetchmany(cur.itersize)
+                columns = (
+                    [desc[0] for desc in cur.description]
+                    if cur.description else []
+                )
+
+                def _all_rows():
+                    yield from first_batch
+                    yield from cur
 
                 if fmt == "csv":
                     header_buf = io.StringIO()
                     csv.writer(header_buf).writerow(columns)
                     yield header_buf.getvalue().encode("utf-8")
-                    for row in cur:
+                    for row in _all_rows():
                         buf = io.StringIO()
                         # csv.writer coerces everything via str(); None
                         # becomes empty string, which is the CSV convention.
@@ -1100,7 +1113,7 @@ github.com/AndrewVSutherland/lmfdb-mcp</a></p>
                         )
                         yield buf.getvalue().encode("utf-8")
                 else:  # jsonl
-                    for row in cur:
+                    for row in _all_rows():
                         obj = {col: row[i] for i, col in enumerate(columns)}
                         yield (json.dumps(obj, default=str) + "\n").encode("utf-8")
         except Exception as e:
