@@ -35,6 +35,7 @@ The code in this repository was written entirely by Claude Opus 4.6.
 | `run_sql`       | Run an arbitrary SELECT query (max 100,000 rows)      |
 | `count_rows`    | Count rows with optional WHERE clause                 |
 | `table_stats`   | Compute min/max/avg/stddev for a numeric column       |
+| `export_query`  | Bulk download (CSV or JSONL) via short-lived URL |
 
 ## Connecting Claude to the MCP server
 
