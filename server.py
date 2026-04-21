@@ -1100,22 +1100,43 @@ github.com/AndrewVSutherland/lmfdb-mcp</a></p>
                     yield from first_batch
                     yield from cur
 
+                # Accumulate output in a buffer and only yield when it
+                # crosses FLUSH_BYTES. Yielding one tiny chunk per row
+                # is ~100x slower end-to-end: Starlette's threadpool hop
+                # per next() plus Cloud Run's front-end buffering of
+                # small chunks dominates actual throughput (observed
+                # ~200 ms per yield for ~20-byte chunks). Batching keeps
+                # the stream behaviour (large exports still flow) while
+                # amortising per-yield overhead.
+                FLUSH_BYTES = 64 * 1024
+                buf = io.StringIO()
+
                 if fmt == "csv":
-                    header_buf = io.StringIO()
-                    csv.writer(header_buf).writerow(columns)
-                    yield header_buf.getvalue().encode("utf-8")
+                    writer = csv.writer(buf)
+                    writer.writerow(columns)
                     for row in _all_rows():
-                        buf = io.StringIO()
                         # csv.writer coerces everything via str(); None
                         # becomes empty string, which is the CSV convention.
-                        csv.writer(buf).writerow(
+                        writer.writerow(
                             ["" if v is None else v for v in row]
                         )
-                        yield buf.getvalue().encode("utf-8")
+                        if buf.tell() >= FLUSH_BYTES:
+                            yield buf.getvalue().encode("utf-8")
+                            buf.seek(0)
+                            buf.truncate()
                 else:  # jsonl
                     for row in _all_rows():
                         obj = {col: row[i] for i, col in enumerate(columns)}
-                        yield (json.dumps(obj, default=str) + "\n").encode("utf-8")
+                        buf.write(json.dumps(obj, default=str))
+                        buf.write("\n")
+                        if buf.tell() >= FLUSH_BYTES:
+                            yield buf.getvalue().encode("utf-8")
+                            buf.seek(0)
+                            buf.truncate()
+
+                # Flush any trailing bytes.
+                if buf.tell() > 0:
+                    yield buf.getvalue().encode("utf-8")
         except Exception as e:
             log.error("export stream failed for token=%s: %s", token[:8], e)
             # We've likely already started sending the response; we can't
