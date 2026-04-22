@@ -426,7 +426,20 @@ def _estimate_row_count(sql: str) -> tuple[int | None, str | None]:
         log.info("EXPLAIN rejected export_query SQL: %s", e)
         return None, str(e).strip()
     try:
-        return int(plan[0]["Plan"]["Plan Rows"]), None
+        root = plan[0]["Plan"]
+        # Walk past the top-level Limit node if present. _apply_export_limit
+        # always appends a LIMIT to the SQL we EXPLAIN here, so the
+        # planner's top-level Plan Rows is clamped to the LIMIT value
+        # (e.g. exactly 100000 for the default cap). That defeats the
+        # point of an "estimate vs cap" comparison — the number we want
+        # is the underlying scan/join estimate, which sits one level
+        # deeper in the plan tree. For user-submitted queries that
+        # themselves contain a LIMIT we do the same thing, which is
+        # slightly generous (the underlying scan may match more rows
+        # than the user asked for) but still informative.
+        if root.get("Node Type") == "Limit" and root.get("Plans"):
+            root = root["Plans"][0]
+        return int(root["Plan Rows"]), None
     except (KeyError, IndexError, TypeError, ValueError) as e:
         log.info("Could not parse EXPLAIN plan for row estimate: %s", e)
         return None, None
@@ -959,15 +972,16 @@ def export_query(
         Or {"error": "..."} on failure.
 
     Note on estimated_rows: this comes from Postgres's query planner
-    (EXPLAIN) and assumes WHERE predicates are statistically independent.
-    For queries with correlated predicates — notably
-    (rank, conductor) on ec_curvedata — it can be off by 10×–1000× in
-    either direction. Treat it as orientation only; the actual row count
-    in the downloaded file is ground truth. When the estimate exceeds
-    the applied max_rows cap, "estimate_exceeds_cap": true is included
-    so you can decide whether to raise max_rows or tighten the query.
-    estimated_rows is null when EXPLAIN returns an unparseable plan or
-    when the query itself is an EXPLAIN statement.
+    (EXPLAIN) and reflects the estimated number of rows your WHERE/JOIN
+    clauses match, ignoring any LIMIT. It assumes WHERE predicates are
+    statistically independent, so for queries with correlated predicates —
+    notably (rank, conductor) on ec_curvedata — it can be off by 10×–
+    1000× in either direction. Treat it as orientation only; the actual
+    row count in the downloaded file is ground truth. When the estimate
+    exceeds the applied max_rows cap, "estimate_exceeds_cap": true is
+    included so you can decide whether to raise max_rows or tighten the
+    query. estimated_rows is null only when EXPLAIN returns an
+    unparseable plan.
     """
     _log_tool("export_query", sql=sql[:1000], format=format, max_rows=max_rows)
 
@@ -985,6 +999,15 @@ def export_query(
     if keyword not in ("SELECT", "WITH", "EXPLAIN"):
         return json.dumps({
             "error": "Only SELECT / WITH / EXPLAIN queries can be exported.",
+        })
+    if keyword == "EXPLAIN":
+        # EXPLAIN passes the allowlist above (inherited from run_sql), but
+        # Postgres does not allow cursors over utility statements — the
+        # server-side streaming path does DECLARE ... CURSOR FOR <sql>,
+        # which rejects EXPLAIN with a syntax error and fails mid-stream.
+        # EXPLAIN output is always small; point the caller at run_sql.
+        return json.dumps({
+            "error": "EXPLAIN is not supported by export_query; use run_sql instead.",
         })
     blocked = _check_blocked(stripped)
     if blocked:
