@@ -393,20 +393,43 @@ def _apply_export_limit(sql: str, requested_limit: int) -> str:
     return clean + f" LIMIT {effective}"
 
 
-def _estimate_row_count(sql: str) -> int | None:
+def _estimate_row_count(sql: str) -> tuple[int | None, str | None]:
     """
-    Run EXPLAIN (FORMAT JSON) <sql> and return the top-level row estimate.
-    Returns None on failure; the caller can proceed without an estimate.
+    Run EXPLAIN (FORMAT JSON) <sql> and return (row_estimate, explain_error).
+
+    Three outcomes:
+      - EXPLAIN succeeds and the plan-row count is extractable:
+            (int, None).
+      - EXPLAIN itself rejects the query (syntax error, unknown column,
+        unknown table, bad cast, etc. — i.e. the SQL is invalid against
+        the current schema): (None, "<error message>"). The caller
+        should refuse to register an export, otherwise the failure
+        surfaces only mid-stream as a partial/empty download.
+      - EXPLAIN succeeds but we can't parse a row count out of the plan
+        (exotic plan shape, unusual statement type): (None, None).
+        The caller should proceed without an estimate.
+
+    User-submitted EXPLAIN queries are skipped entirely (nested EXPLAIN
+    is not allowed by Postgres), and reported as the third case.
     """
+    stripped = sql.lstrip()
+    first_keyword = stripped.split(None, 1)[0].upper() if stripped else ""
+    if first_keyword == "EXPLAIN":
+        return None, None
+
     try:
         conn = get_connection()
         with conn.cursor() as cur:
             cur.execute(f"EXPLAIN (FORMAT JSON) {sql}")
             plan = cur.fetchone()[0]
-            return int(plan[0]["Plan"]["Plan Rows"])
     except Exception as e:
-        log.info("EXPLAIN failed for export row estimate: %s", e)
-        return None
+        log.info("EXPLAIN rejected export_query SQL: %s", e)
+        return None, str(e).strip()
+    try:
+        return int(plan[0]["Plan"]["Plan Rows"]), None
+    except (KeyError, IndexError, TypeError, ValueError) as e:
+        log.info("Could not parse EXPLAIN plan for row estimate: %s", e)
+        return None, None
 
 
 @mcp.tool(annotations=_READ_ONLY)
@@ -927,12 +950,24 @@ def export_query(
           {
             "url": "https://.../download/<token>",
             "format": "csv",
-            "estimated_rows": 84321,       # from EXPLAIN; may be null
+            "estimated_rows": 84321,       # see note below; may be null
             "max_rows": 100000,            # cap actually applied
+            "estimate_exceeds_cap": false, # only present when true
             "expires_in_seconds": 600,
             "sandbox_hint": "import pandas as pd; df = pd.read_csv(url)"
           }
         Or {"error": "..."} on failure.
+
+    Note on estimated_rows: this comes from Postgres's query planner
+    (EXPLAIN) and assumes WHERE predicates are statistically independent.
+    For queries with correlated predicates — notably
+    (rank, conductor) on ec_curvedata — it can be off by 10×–1000× in
+    either direction. Treat it as orientation only; the actual row count
+    in the downloaded file is ground truth. When the estimate exceeds
+    the applied max_rows cap, "estimate_exceeds_cap": true is included
+    so you can decide whether to raise max_rows or tighten the query.
+    estimated_rows is null when EXPLAIN returns an unparseable plan or
+    when the query itself is an EXPLAIN statement.
     """
     _log_tool("export_query", sql=sql[:1000], format=format, max_rows=max_rows)
 
@@ -964,9 +999,14 @@ def export_query(
         return json.dumps({"error": "max_rows must be >= 1."})
     bounded_sql = _apply_export_limit(stripped, requested)
 
-    # Cheap planner-based row estimate (not exact — could be off by an
-    # order of magnitude for complex joins, but useful for orientation).
-    estimated = _estimate_row_count(bounded_sql)
+    # Cheap planner-based row estimate (not exact — can be off by 10×–
+    # 1000× for queries with correlated WHERE predicates; see the tool
+    # docstring). EXPLAIN also serves as an SQL-validity check: if it
+    # fails, the query is broken and we refuse the export now rather
+    # than let the error surface mid-stream as a partial download.
+    estimated, explain_error = _estimate_row_count(bounded_sql)
+    if explain_error is not None:
+        return json.dumps({"error": f"Query is invalid: {explain_error}"})
 
     # Register the token.
     try:
@@ -985,14 +1025,24 @@ def export_query(
         else 'import pandas as pd; df = pd.read_json(url, lines=True)'
     )
 
-    return json.dumps({
+    applied_cap = min(requested, EXPORT_MAX_ROWS)
+    response = {
         "url": url,
         "format": fmt,
         "estimated_rows": estimated,
-        "max_rows": min(requested, EXPORT_MAX_ROWS),
+        "max_rows": applied_cap,
         "expires_in_seconds": EXPORT_TOKEN_TTL,
         "sandbox_hint": hint,
-    })
+    }
+    # Surface the common case where the caller might be about to hit
+    # the cap and want to raise it or tighten the query. Only emitted
+    # when true, to keep the happy-path response uncluttered. Note that
+    # estimated_rows can be very inaccurate (see docstring), so this
+    # flag is a hint, not a guarantee.
+    if estimated is not None and estimated > applied_cap:
+        response["estimate_exceeds_cap"] = True
+
+    return json.dumps(response)
 
 
 # ---------------------------------------------------------------------------

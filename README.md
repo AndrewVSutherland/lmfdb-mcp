@@ -57,6 +57,30 @@ All Claude models (Haiku/Sonnet/Opus) can use tools via MCP servers.
 An organization Owner adds the connector once in **Organization Settings →
 Connectors**, and all members can then enable it per-conversation.
 
+## Enabling sandbox access for `export_query` (Claude.ai)
+
+The `export_query` tool returns a URL on `https://mcp.lmfdb.org/` instead
+of streaming rows through the MCP conversation. For Claude to actually
+fetch that URL inside its code-execution sandbox — where pandas, numpy,
+and plotting happen — the domain needs to be on the sandbox's
+network-egress allowlist. The other eight tools return data directly
+through the MCP conversation and are unaffected; this setup is only
+needed if you (or your users) want to use `export_query`.
+
+### Setup
+
+1. Go to [claude.ai](https://claude.ai) → **Settings** → **Capabilities**.
+2. Under **Code execution and file creation**, make sure the feature is
+   enabled and turn on **Allow network egress**.
+3. Set the domain allowlist to **Package managers and specific domains**
+   and add `mcp.lmfdb.org` to **Additional allowed domains**.
+
+### Settings apply to new conversations only
+
+Allowlist changes are copied into the sandbox when a conversation
+starts. Toggling settings mid-conversation has no effect on the current
+chat — start a fresh conversation after updating.
+
 ## Connecting ChatGPT to the MCP server
 
 In ChatGPT MCP connectors are treated as "apps".  Custom apps (including the LMFDB MCP server) are not available on the Free/Go plan, as you need to enable **Developer mode** in order to install them.
