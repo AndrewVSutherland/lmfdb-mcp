@@ -53,7 +53,15 @@ DEFAULT_LIMIT = int(os.environ.get("LMFDB_DEFAULT_LIMIT", "100"))
 EXPORT_MAX_ROWS = int(os.environ.get("LMFDB_EXPORT_MAX_ROWS", "1000000"))
 EXPORT_DEFAULT_ROWS = int(os.environ.get("LMFDB_EXPORT_DEFAULT_ROWS", "100000"))
 EXPORT_TOKEN_TTL = int(os.environ.get("LMFDB_EXPORT_TOKEN_TTL", "600"))  # seconds
-EXPORT_MAX_TOKENS = int(os.environ.get("LMFDB_EXPORT_MAX_TOKENS", "1000"))
+# Rows fetched per network round-trip from the server-side cursor during an
+# export. This is also the dominant memory cost of a streaming export: a
+# single fetchmany(ITERSIZE) materialises that many rows as live Python
+# objects at once. For wide rows (e.g. genus-2 L-functions: 100+ Dirichlet
+# coefficients, ragged Euler factors, ~160 plot values, ~40 high-precision
+# zero strings) one row is ~20-50 KB of Python objects, so the old value of
+# 10000 peaked >512 MiB and the instance was OOM-killed mid-stream. 1000
+# keeps peak memory ~10x lower at negligible throughput cost.
+EXPORT_ITERSIZE = int(os.environ.get("LMFDB_EXPORT_ITERSIZE", "1000"))
 
 # Public base URL for download links. In production this should be set to
 # the externally-visible URL of this server (e.g. https://mcp.lmfdb.org).
@@ -314,67 +322,101 @@ def _fetch_metadata() -> list:
 
 
 # ---------------------------------------------------------------------------
-# Export token store
+# Export token store (stateless, signed)
 # ---------------------------------------------------------------------------
-# export_query() registers a validated SELECT along with a format, returning
-# a short-lived opaque token. The /download/<token> endpoint later looks up
-# the SQL by token, streams the result set as CSV or JSONL, and discards
-# the token on expiry. Tokens are stateful and process-local; with Cloud Run
-# min-instances=1 and our expected traffic, cross-instance routing hasn't
-# been an issue. A restart loses pending tokens; clients should retry.
+# export_query() encodes a validated SELECT + format into a signed, opaque
+# token; the /download/<token> endpoint verifies the signature and streams
+# the result set as CSV or JSONL. Tokens carry their own state (see below),
+# so they work across Cloud Run instances and survive restarts.
 
+import base64
+import hashlib
+import hmac
 import secrets
 import time as _time
 
-_export_tokens: dict = {}
-_export_tokens_lock = threading.Lock()
+# Earlier versions kept token -> SQL in a process-local dict. That only works
+# on a single instance: export_query and GET /download/<token> are separate,
+# independently load-balanced requests, so under Cloud Run autoscaling
+# (minScale >= 1, maxScale > 1) a token minted on instance A is invisible to
+# instance B and the download 404s. Instead we make the token self-contained:
+#   token = b64url(payload) "." b64url(HMAC-SHA256(secret, b64url(payload)))
+# Any instance can verify it with the shared secret, so there is no
+# server-side state to lose on scale-out or restart. The validated,
+# already-LIMIT-capped SQL is embedded in the payload; on use we re-run the
+# SELECT-only blocklist as defence-in-depth (the HMAC already prevents
+# tampering, and the embedded SQL is just a SELECT the caller generated).
+#
+# LMFDB_EXPORT_SECRET MUST be set to the SAME value on every instance for
+# cross-instance verification to work. If it is unset we fall back to a
+# per-process random key and log loudly -- in that mode downloads will 404
+# across instances exactly as before, so set it in production (e.g. via
+# Secret Manager, injected as an env var).
+_EXPORT_SECRET = os.environ.get("LMFDB_EXPORT_SECRET", "").encode("utf-8")
+if not _EXPORT_SECRET:
+    _EXPORT_SECRET = secrets.token_bytes(32)
+    log.warning(
+        "LMFDB_EXPORT_SECRET is not set; using a per-process random key. "
+        "Export download links will NOT work across instances or survive a "
+        "restart. Set LMFDB_EXPORT_SECRET (identical on all instances) in "
+        "production."
+    )
 
 
-def _prune_expired_tokens(now: float | None = None) -> None:
-    """Drop any tokens whose expires_at is in the past. Caller holds the lock."""
-    if now is None:
-        now = _time.time()
-    expired = [t for t, rec in _export_tokens.items() if rec["expires_at"] <= now]
-    for t in expired:
-        del _export_tokens[t]
+def _b64u_encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def _b64u_decode(s: str) -> bytes:
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+
+def _sign(payload_b64: str) -> str:
+    sig = hmac.new(
+        _EXPORT_SECRET, payload_b64.encode("ascii"), hashlib.sha256
+    ).digest()
+    return _b64u_encode(sig)
 
 
 def _register_export(sql: str, fmt: str, max_rows: int) -> dict:
     """
-    Register a validated SELECT query for later streaming. Returns a dict
-    with token, expires_at, and other metadata. Raises RuntimeError if
-    the token store is full.
+    Encode a validated, LIMIT-capped SELECT into a signed, stateless token.
+    Returns {"token": ...}; no server-side state is kept. max_rows is already
+    baked into `sql` as a LIMIT by the caller, so it need not be stored.
     """
-    now = _time.time()
-    token = secrets.token_urlsafe(24)
-    record = {
-        "sql": sql,
-        "format": fmt,
-        "max_rows": max_rows,
-        "created_at": now,
-        "expires_at": now + EXPORT_TOKEN_TTL,
-    }
-    with _export_tokens_lock:
-        _prune_expired_tokens(now)
-        if len(_export_tokens) >= EXPORT_MAX_TOKENS:
-            raise RuntimeError(
-                "Export token store is full; try again in a few minutes."
-            )
-        _export_tokens[token] = record
-    return {"token": token, **record}
+    payload = {"q": sql, "f": fmt, "e": int(_time.time()) + EXPORT_TOKEN_TTL}
+    payload_b64 = _b64u_encode(
+        json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    )
+    return {"token": f"{payload_b64}.{_sign(payload_b64)}"}
 
 
 def _lookup_export(token: str) -> dict | None:
-    """Return the SQL/format record for a token, or None if missing/expired."""
-    now = _time.time()
-    with _export_tokens_lock:
-        rec = _export_tokens.get(token)
-        if rec is None:
-            return None
-        if rec["expires_at"] <= now:
-            del _export_tokens[token]
-            return None
-        return dict(rec)  # return a copy
+    """
+    Verify a signed token and return {"sql", "format"}, or None if the token
+    is malformed, has a bad signature, or has expired.
+    """
+    try:
+        payload_b64, sig_b64 = token.split(".", 1)
+    except ValueError:
+        return None
+    # Constant-time signature check before we trust any embedded content.
+    if not hmac.compare_digest(_sign(payload_b64), sig_b64):
+        return None
+    try:
+        payload = json.loads(_b64u_decode(payload_b64))
+    except Exception:
+        return None
+    if not isinstance(payload, dict) or payload.get("e", 0) <= int(_time.time()):
+        return None
+    sql = payload.get("q")
+    fmt = payload.get("f")
+    if not isinstance(sql, str) or fmt not in ("csv", "jsonl"):
+        return None
+    # Defence-in-depth: re-validate against the SELECT-only blocklist.
+    if _check_blocked(sql.strip()):
+        return None
+    return {"sql": sql, "format": fmt}
 
 
 # LIMIT-handling helper specifically for export queries. The regular
@@ -1154,9 +1196,12 @@ github.com/AndrewVSutherland/lmfdb-mcp</a></p>
                 options="-c statement_timeout=600000",  # 10 min for exports
             )
             # Named cursor -> PostgreSQL server-side cursor (streamed fetch).
-            cursor_name = f"mcp_export_{token[:16]}"
+            # Signed tokens contain '.', '-', '_'; hash to a safe identifier.
+            cursor_name = "mcp_export_" + hashlib.sha256(
+                token.encode()
+            ).hexdigest()[:16]
             with conn.cursor(name=cursor_name) as cur:
-                cur.itersize = 10000  # rows per network roundtrip
+                cur.itersize = EXPORT_ITERSIZE  # rows per network roundtrip
                 cur.execute(sql)
 
                 # psycopg2 named cursors: execute() issues DECLARE, which
