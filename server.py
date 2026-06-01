@@ -45,6 +45,12 @@ DB_PASS = os.environ.get("LMFDB_PASSWORD", "lmfdb")
 
 MAX_ROWS = int(os.environ.get("LMFDB_MAX_ROWS", "100000"))
 DEFAULT_LIMIT = int(os.environ.get("LMFDB_DEFAULT_LIMIT", "100"))
+# Safety cap on the approximate serialized size of a run_sql result. run_sql
+# results flow back through the MCP/LLM context and are meant for inspection,
+# not bulk transfer (that is what export_query is for). Without a byte cap a
+# single query for many wide rows (e.g. genus-2 L-function rows with big jsonb
+# arrays) can fetchall() gigabytes and OOM-kill the whole instance.
+RUN_SQL_MAX_BYTES = int(os.environ.get("LMFDB_RUN_SQL_MAX_BYTES", str(50 * 1024 * 1024)))
 
 # Export / bulk download config. Exports stream results to a download URL
 # instead of returning them through the MCP tool response, so the row cap
@@ -75,14 +81,30 @@ MCP_BASE_URL = os.environ.get("MCP_BASE_URL", "").rstrip("/")
 # ---------------------------------------------------------------------------
 
 def get_connection():
-    """Get a database connection, reusing if possible."""
+    """
+    Get a database connection, reusing the cached one only if it is still
+    alive. The liveness check issues a real `SELECT 1` round-trip: a bare
+    attribute read (.closed / .isolation_level) only inspects local libpq
+    state and does NOT detect a connection the server has silently dropped
+    (idle reap, mirror restart), which then surfaces as `SSL SYSCALL error:
+    EOF detected` on the first real query. The round-trip is sub-100ms and
+    runs only on the interactive/export paths (the streaming download path
+    uses its own fresh connection), so the cost is negligible. On any failure
+    we discard the connection and reconnect.
+    """
     global _connection
-    try:
-        if _connection is not None and _connection.closed == 0:
-            _connection.isolation_level
+    if _connection is not None and _connection.closed == 0:
+        try:
+            with _connection.cursor() as _cur:
+                _cur.execute("SELECT 1")
+                _cur.fetchone()
             return _connection
-    except Exception:
-        pass
+        except Exception:
+            try:
+                _connection.close()
+            except Exception:
+                pass
+            _connection = None
     _connection = psycopg2.connect(
         host=DB_HOST,
         port=DB_PORT,
@@ -182,13 +204,39 @@ def run_query(sql: str, params: list | None = None, limit: int | None = None) ->
             # skips %-substitution and bare % characters (e.g. in LIKE
             # patterns) are treated literally.
             cur.execute(sql, params if params else None)
-            rows = cur.fetchall()
             columns = [desc[0] for desc in cur.description] if cur.description else []
-            return {
+            # Bound result memory by an approximate byte budget, not just the
+            # row LIMIT. A single run_sql for many *wide* rows (e.g. genus-2
+            # L-function rows carrying large jsonb arrays) can materialise
+            # gigabytes via fetchall() and OOM-kill the whole instance, taking
+            # every other request on that instance down with it. Fetch in
+            # batches and stop once we cross the budget, flagging truncation.
+            rows = []
+            truncated = False
+            approx_bytes = 0
+            while True:
+                batch = cur.fetchmany(2000)
+                if not batch:
+                    break
+                rows.extend(dict(r) for r in batch)
+                approx_bytes += len(json.dumps(batch, default=str))
+                if approx_bytes >= RUN_SQL_MAX_BYTES:
+                    truncated = True
+                    break
+            result = {
                 "columns": columns,
                 "row_count": len(rows),
-                "rows": [dict(r) for r in rows],
+                "rows": rows,
             }
+            if truncated:
+                result["truncated"] = True
+                result["note"] = (
+                    f"Result truncated at ~{RUN_SQL_MAX_BYTES // (1024 * 1024)} MB "
+                    f"({len(rows)} rows returned) to protect server memory. Use "
+                    "export_query for large result sets, or add a tighter LIMIT "
+                    "or select fewer columns."
+                )
+            return result
     except Exception as e:
         global _connection
         _connection = None
@@ -1192,7 +1240,7 @@ github.com/AndrewVSutherland/lmfdb-mcp</a></p>
                 dbname=DB_NAME,
                 user=DB_USER,
                 password=DB_PASS,
-                connect_timeout=30,
+                connect_timeout=10,
                 options="-c statement_timeout=600000",  # 10 min for exports
             )
             # Named cursor -> PostgreSQL server-side cursor (streamed fetch).
