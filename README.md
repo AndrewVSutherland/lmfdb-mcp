@@ -43,7 +43,7 @@ All Claude models (Haiku/Sonnet/Opus) can use tools via MCP servers.
 
 ### For Individual Users (Pro / Max / Free)
 
-1. Go to [claude.ai](https://claude.ai) → **Settings** → **Connectors**
+1. In the [claude.ai](https://claude.ai) sidebar, click **Customize** → **Connectors**
 2. Click **Add custom connector**
 3. Enter:
    - **Name:** `LMFDB`
