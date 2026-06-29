@@ -1164,8 +1164,14 @@ def export_query(
 if __name__ == "__main__":
     import urllib.request
     import uvicorn
-    from starlette.responses import HTMLResponse, Response, StreamingResponse
+    from starlette.responses import (
+        HTMLResponse,
+        JSONResponse,
+        Response,
+        StreamingResponse,
+    )
     from starlette.routing import Route
+    from starlette.concurrency import run_in_threadpool
 
     port = int(os.environ.get("PORT", "8080"))
     mcp_app = mcp.streamable_http_app()
@@ -1352,10 +1358,70 @@ github.com/AndrewVSutherland/lmfdb-mcp</a></p>
             },
         )
 
-    # Add the landing page, favicon, and download routes to the MCP app.
+    # ----- /sql ------------------------------------------------------------
+    # Plain HTTP access to run_query() for non-MCP clients (scripts, a Lean
+    # tactic shelling out with curl, etc.). Same query surface and the SAME
+    # guardrails as the run_sql MCP tool -- SELECT/WITH/EXPLAIN only, blocked-
+    # pattern list, 5-way concurrency semaphore, 120s statement timeout, row
+    # and byte caps -- because it reuses run_query() verbatim. The only thing
+    # it strips is the MCP/JSON-RPC/SSE envelope: one request in, one JSON
+    # object out ({"columns","row_count","rows"} or {"error": ...}). No new
+    # exposure vs. the existing auth-less MCP endpoint, which already runs the
+    # identical query path.
+    async def sql_endpoint(request):
+        # Accept {"sql": ..., "limit": ...} as a JSON POST body, or as
+        # ?sql=...&limit=... query params on a GET (handy for quick manual
+        # testing). POST is preferred: query strings have length limits and
+        # land in access logs.
+        if request.method == "POST":
+            try:
+                payload = await request.json()
+            except Exception:
+                return JSONResponse(
+                    {"error": "Request body must be valid JSON."},
+                    status_code=400,
+                )
+            sql = payload.get("sql")
+            limit = payload.get("limit", DEFAULT_LIMIT)
+        else:  # GET
+            sql = request.query_params.get("sql")
+            limit = request.query_params.get("limit", DEFAULT_LIMIT)
+
+        if not isinstance(sql, str) or not sql.strip():
+            return JSONResponse(
+                {"error": "Missing required 'sql' field."},
+                status_code=400,
+            )
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            return JSONResponse(
+                {"error": "'limit' must be an integer."},
+                status_code=400,
+            )
+
+        log.info(
+            "tool=sql_http method=%s sql=%r limit=%d",
+            request.method, sql[:1000], limit,
+        )
+
+        # run_query() is synchronous and blocks on psycopg2 I/O. Run it in a
+        # worker thread so a slow query doesn't stall uvicorn's event loop and
+        # block every other request (MCP traffic included) on this instance.
+        # Positional args are run_query(sql, params=None, limit=limit).
+        result = await run_in_threadpool(run_query, sql, None, limit)
+
+        # run_query flattens both client errors (bad SQL, blocked pattern) and
+        # transport errors (mirror unreachable) into {"error": ...}; map any
+        # error to 400. Split 4xx/5xx by inspecting the message if you care.
+        status = 400 if "error" in result else 200
+        return JSONResponse(result, status_code=status)
+
+    # Add the landing page, favicon, download, and /sql routes to the MCP app.
     mcp_app.routes.append(Route("/", landing))
     mcp_app.routes.append(Route("/favicon.ico", favicon))
     mcp_app.routes.append(Route("/download/{token}", download))
+    mcp_app.routes.append(Route("/sql", sql_endpoint, methods=["GET", "POST"]))
     mcp_app.middleware_stack = None  # force rebuild to pick up new routes
 
     uvicorn.run(mcp_app, host="0.0.0.0", port=port)
